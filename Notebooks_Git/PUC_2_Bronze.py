@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Bronze
 # MAGIC Ingestão das 4 fontes (BDEP, BAR, BMP, ECO) do volume `raw` para tabelas Delta Bronze.
@@ -66,7 +70,6 @@ RAW_BDEP = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bdep"
 
 df_bdep = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .option("sep", ";")
     .option("encoding", "ISO-8859-1")
     .csv(f"{RAW_BDEP}/*.csv"))
@@ -91,7 +94,6 @@ RAW_BAR = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bar"
 
 df_bar = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .option("sep", ",")
     .option("encoding", "UTF-8")
     .csv(f"{RAW_BAR}/*.csv"))
@@ -122,7 +124,6 @@ PASTA_BMP_CORRIGIDO = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bmp_corrigido"
 # 3a. Diagnóstico: identifica quais arquivos têm alta taxa de malformação (coluna "ano" fora do padrão AAAA)
 df_bmp_diagnostico = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .csv(f"{RAW_BMP}/*.csv")
     .withColumn("arquivo_origem", F.col("_metadata.file_path")))
 
@@ -161,12 +162,10 @@ print(f"{len(arquivos_problematicos)} arquivo(s) corrigido(s) em {PASTA_BMP_CORR
 # 3c. Lê os dois conjuntos (arquivos que já liam certo + arquivos corrigidos) e junta em um só DataFrame
 df_bmp_ok = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .csv(arquivos_ok))
 
 df_bmp_corrigido = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .csv(f"{PASTA_BMP_CORRIGIDO}/*.csv"))
 
 df_bmp = df_bmp_ok.unionByName(df_bmp_corrigido, allowMissingColumns=True)
@@ -193,12 +192,10 @@ RAW_ECO = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/economico"
 
 df_cambio = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .csv(f"{RAW_ECO}/cambio_usd_brl.csv"))
 
 df_brent = (spark.read
     .option("header", True)
-    .option("inferSchema", True)
     .csv(f"{RAW_ECO}/brent_spot.csv"))
 
 df_cambio_bronze = sanitizar_para_delta(df_cambio)
@@ -210,15 +207,26 @@ df_brent_bronze.printSchema()
 # COMMAND ----------
 
 # MAGIC %md ## 5. Gravação das tabelas Bronze
+# MAGIC  Usamos `DROP TABLE` antes de recriar, em vez de confiar só em `overwrite`/`overwriteSchema` -  durante o desenvolvimento iterativo deste pipeline, uma tabela chegou a reter metadado de schema de versões anteriores (nomes de coluna antigos), causando `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` mesmo com o DataFrame novo correto. Apagar e recriar elimina esse tipo de inconsistência.
+# MAGIC  
 
 # COMMAND ----------
 
-df_bmp_bronze.write.mode("overwrite").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bmp")
-df_bar_bronze.write.mode("overwrite").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bar")
-df_bdep_bronze.write.mode("overwrite").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bdep")
-df_cambio_bronze.write.mode("overwrite").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_cambio")
-df_brent_bronze.write.mode("overwrite").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_brent")
-
+for tabela in ["bronze_bmp", "bronze_bar", "bronze_bdep", "bronze_cambio", "bronze_brent"]:
+    spark.sql(f"DROP TABLE IF EXISTS {CATALOGO}.{SCHEMA}.{tabela}")
+ 
+df_bmp_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bmp")
+df_bar_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bar")
+df_bdep_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bdep")
+df_cambio_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_cambio")
+df_brent_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_brent")
+ 
 for tabela in ["bronze_bmp", "bronze_bar", "bronze_bdep", "bronze_cambio", "bronze_brent"]:
     existe = spark.catalog.tableExists(f"{CATALOGO}.{SCHEMA}.{tabela}")
     print(f"{tabela}: {'existe' if existe else 'AINDA NÃO EXISTE'}")
+
+# COMMAND ----------
+
+for tabela in ["bronze_bmp", "bronze_bar", "bronze_bdep", "bronze_cambio", "bronze_brent"]:
+    n = spark.table(f"PUC_Sprint_2.anp.{tabela}").count()
+    print(f"{tabela}: {n} linhas")
