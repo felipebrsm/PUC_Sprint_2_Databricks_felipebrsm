@@ -44,13 +44,12 @@ def padronizar_texto(df, colunas=None):
         df = df.withColumn(c, F.upper(F.trim(F.translate(F.col(c), ACCENTS_FROM, ACCENTS_TO))))
     return df
 
-
 def corrigir_mojibake_colunas(df, colunas):
-    """Corrige texto UTF-8 que foi lido incorretamente como ISO-8859-1 (caso do BAR)."""
     for c in colunas:
-        df = df.withColumn(c, F.decode(F.encode(F.col(c), "ISO-8859-1"), "UTF-8"))
+        candidato = F.decode(F.encode(F.col(c), "ISO-8859-1"), "UTF-8")
+        usar_candidato = F.col(c).rlike("[ÃÂ]") & ~candidato.contains("\uFFFD")
+        df = df.withColumn(c, F.when(usar_candidato, candidato).otherwise(F.col(c)))
     return df
-
 
 def numero_br_para_double(df, colunas):
     """Formato brasileiro: ponto = milhar, vírgula = decimal. Usado no BMP.
