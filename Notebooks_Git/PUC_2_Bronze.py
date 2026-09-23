@@ -29,10 +29,14 @@ SCHEMA = "anp"
 
 def sanitizar_para_delta(df):
     """O mínimo necessário para o Delta aceitar a tabela: troca só os caracteres
-    proibidos (espaço, vírgula, ponto-e-vírgula, chaves, parênteses, tab, quebra
-    de linha, igual) por '_'. Mantém acento, maiúscula, tudo o resto como veio
-    do arquivo original - deixar "bonito" é trabalho da Silver, não da Bronze."""
-    novos_nomes = [re.sub(r"[ ,;{}()\n\t=/]+", "_", c).strip("_") for c in df.columns]
+    proibidos (espaço, vírgula, ponto-e-vírgula, chaves, parênteses, colchetes, tab,
+    quebra de linha, igual) por '_'. Mantém acento, maiúscula, tudo o resto como veio
+    do arquivo original - deixar "bonito" é trabalho da Silver, não da Bronze.
+    Colchetes '[]' foram adicionados depois de descobrir que o arquivo de BMP de 2024
+    (producao_por_poco_2024.csv e os 4 trimestrais de terra) vem com o nome de cada
+    coluna literalmente entre colchetes, ex.: '[Mês/Ano]' - não é um jeito de exibição,
+    é a string real da coluna, então sem esse ajuste ela sobrevivia à sanitização."""
+    novos_nomes = [re.sub(r"[ ,;{}()\[\]\n\t=/]+", "_", c).strip("_") for c in df.columns]
     return df.toDF(*novos_nomes)
 
 
@@ -173,7 +177,50 @@ df_bmp = df_bmp_ok.unionByName(df_bmp_corrigido, allowMissingColumns=True)
 malformadas_final = df_bmp.filter(~F.col(df_bmp.columns[0]).rlike("^(19|20)[0-9]{2}$")).count()
 print(f"Total após união: {df_bmp.count()} | ainda malformadas: {malformadas_final}")
 
-df_bmp_bronze = sanitizar_para_delta(df_bmp)
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3d. BMP 2024 - fonte separada, nomenclatura diferente
+# MAGIC
+# MAGIC **O que foi encontrado:** a página de dados abertos não tinha, no scrape original, nenhum arquivo de
+# MAGIC 2024 no padrão `producao-terra-*`/`producao-mar-*`. O ano existe, só que publicado com outro nome de
+# MAGIC arquivo: `producao_por_poco_2024.csv` (ambiente MAR, ano inteiro, 15229 linhas) e 4 arquivos
+# MAGIC trimestrais `producao-por-poco-terra-trim-{1..4}.csv` (ambiente TERRA, um trimestre cada). Validado que
+# MAGIC os 5 juntos cobrem jan-dez/2024 sem sobrepor nenhum mês (cada trimestral tem exatamente 3 meses
+# MAGIC distintos, o anual tem os 12). Além disso, o cabeçalho desses 5 arquivos vem com cada nome de coluna
+# MAGIC literalmente entre colchetes (`[Mês/Ano]`, `[Ano]`, ...) - por isso o `sanitizar_para_delta` acima
+# MAGIC precisou aprender a remover `[` e `]`. Sanitizamos cada fonte (2024 e o restante do BMP) separadamente
+# MAGIC antes de unir, porque só depois da sanitização os nomes ficam iguais o suficiente pra bater
+# MAGIC (`[Mês/Ano]` -> `Mês_Ano` == `Mês/Ano` -> `Mês_Ano`). Esse arquivo também trouxe duas colunas que os
+# MAGIC anos anteriores não tinham (`Ambiente`, `Instalação`) - ficam como novo campo, nulo nas linhas antigas,
+# MAGIC via `allowMissingColumns=True`.
+
+# COMMAND ----------
+
+RAW_BMP_2024 = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bmp-2024"
+
+arquivos_2024 = [
+    "producao_por_poco_2024.csv",
+    "producao-por-poco-terra-trim-1.csv",
+    "producao-por-poco-terra-trim-2.csv",
+    "producao-por-poco-terra-trim-3.csv",
+    "producao_por_poco_terra_trim_4.csv",
+]
+
+df_bmp_2024 = (spark.read
+    .option("header", True)
+    .csv([f"{RAW_BMP_2024}/{nome}" for nome in arquivos_2024]))
+
+# Validação: os 12 meses presentes, sem duplicidade entre os 5 arquivos
+meses_2024 = [r[0] for r in df_bmp_2024.select("[Mês/Ano]").distinct().orderBy("[Mês/Ano]").collect()]
+print(f"BMP 2024: {df_bmp_2024.count()} linhas | {len(meses_2024)} meses distintos: {meses_2024}")
+
+# Sanitiza cada fonte separadamente e só então une - ver explicação acima
+df_bmp_bronze_historico = sanitizar_para_delta(df_bmp)
+df_bmp_bronze_2024 = sanitizar_para_delta(df_bmp_2024)
+
+df_bmp_bronze = df_bmp_bronze_historico.unionByName(df_bmp_bronze_2024, allowMissingColumns=True)
+print(f"BMP total (histórico + 2024): {df_bmp_bronze.count()} linhas")
 df_bmp_bronze.printSchema()
 
 # COMMAND ----------
@@ -207,26 +254,23 @@ df_brent_bronze.printSchema()
 # COMMAND ----------
 
 # MAGIC %md ## 5. Gravação das tabelas Bronze
-# MAGIC  Usamos `DROP TABLE` antes de recriar, em vez de confiar só em `overwrite`/`overwriteSchema` -  durante o desenvolvimento iterativo deste pipeline, uma tabela chegou a reter metadado de schema de versões anteriores (nomes de coluna antigos), causando `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` mesmo com o DataFrame novo correto. Apagar e recriar elimina esse tipo de inconsistência.
-# MAGIC  
+# MAGIC
+# MAGIC Usamos `DROP TABLE` antes de recriar, em vez de confiar só em `overwrite`/`overwriteSchema` -
+# MAGIC durante o desenvolvimento iterativo deste pipeline, uma tabela chegou a reter metadado de schema
+# MAGIC de versões anteriores (nomes de coluna antigos), causando `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` mesmo
+# MAGIC com o DataFrame novo correto. Apagar e recriar elimina esse tipo de inconsistência.
 
 # COMMAND ----------
 
 for tabela in ["bronze_bmp", "bronze_bar", "bronze_bdep", "bronze_cambio", "bronze_brent"]:
     spark.sql(f"DROP TABLE IF EXISTS {CATALOGO}.{SCHEMA}.{tabela}")
- 
+
 df_bmp_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bmp")
 df_bar_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bar")
 df_bdep_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_bdep")
 df_cambio_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_cambio")
 df_brent_bronze.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOGO}.{SCHEMA}.bronze_brent")
- 
+
 for tabela in ["bronze_bmp", "bronze_bar", "bronze_bdep", "bronze_cambio", "bronze_brent"]:
     existe = spark.catalog.tableExists(f"{CATALOGO}.{SCHEMA}.{tabela}")
     print(f"{tabela}: {'existe' if existe else 'AINDA NÃO EXISTE'}")
-
-# COMMAND ----------
-
-for tabela in ["bronze_bmp", "bronze_bar", "bronze_bdep", "bronze_cambio", "bronze_brent"]:
-    n = spark.table(f"PUC_Sprint_2.anp.{tabela}").count()
-    print(f"{tabela}: {n} linhas")

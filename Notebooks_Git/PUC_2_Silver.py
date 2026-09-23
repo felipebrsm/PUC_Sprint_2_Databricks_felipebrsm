@@ -1,8 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "5"
-# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Silver
 # MAGIC Consolidação da camada Silver a partir das tabelas Bronze / arquivos raw de BMP, BAR, BDEP e ECO (câmbio + Brent).
@@ -44,12 +40,23 @@ def padronizar_texto(df, colunas=None):
         df = df.withColumn(c, F.upper(F.trim(F.translate(F.col(c), ACCENTS_FROM, ACCENTS_TO))))
     return df
 
+
 def corrigir_mojibake_colunas(df, colunas):
+    """Corrige mojibake testando o RESULTADO da correção, não o padrão da entrada.
+    Um 'Ã' seguido de letra pode ser mojibake real (ex.: 'PetrÃ³leo') ou uma letra
+    portuguesa legítima (ex.: 'GaviÃO', 'SÃO') - não dá para diferenciar só olhando
+    a entrada, como a primeira versão desta função tentava fazer (o que corrompeu
+    'GAVIÃO' -> 'GAVI�O' e similares). A diferença aparece no resultado: se o
+    texto já estava certo, reconvertê-lo gera um caractere de erro '�' (a
+    sequência de bytes não forma UTF-8 válido); se era mojibake de verdade, o
+    resultado sai limpo. Por isso só aplicamos a correção quando o resultado
+    não contém '�'."""
     for c in colunas:
         candidato = F.decode(F.encode(F.col(c), "ISO-8859-1"), "UTF-8")
         usar_candidato = F.col(c).rlike("[ÃÂ]") & ~candidato.contains("\uFFFD")
         df = df.withColumn(c, F.when(usar_candidato, candidato).otherwise(F.col(c)))
     return df
+
 
 def numero_br_para_double(df, colunas):
     """Formato brasileiro: ponto = milhar, vírgula = decimal. Usado no BMP.
@@ -79,88 +86,21 @@ def numero_us_para_double(df, colunas):
 # MAGIC %md
 # MAGIC ## 1. BMP (Boletim Mensal de Produção)
 # MAGIC
-# MAGIC **O que foi encontrado na etapa de diagnóstico:** ~345 mil linhas (7% do total) vinham malformadas -
-# MAGIC concentradas em 15 arquivos específicos (terra trimestral 2018-2021 e mar 2019-2021). A causa raiz era
-# MAGIC dupla: (1) cada linha desses arquivos estava reencapsulada inteira entre aspas, com toda aspa interna
-# MAGIC duplicada (`"122,119"` virou `""122,119""`) - um bug clássico de exportação que trata a linha já-CSV como
-# MAGIC se fosse um único campo de texto a escapar; e (2) esses 15 arquivos não têm um encoding único - alguns
-# MAGIC são Latin-1, outros UTF-8 com BOM - então o encoding precisa ser detectado por arquivo, não fixado.
-# MAGIC O restante do histórico (1941-2018 e 2022+) sempre leu corretamente, sem esse problema.
+# MAGIC **Ajuste de arquitetura:** esta seção lia o `raw/bmp` direto e reimplementava (de novo) a correção de
+# MAGIC encapsulamento duplo/encoding que já tinha sido resolvida na Bronze - duas cópias da mesma lógica.
+# MAGIC Na prática isso mordeu a gente: quando um novo arquivo (BMP 2024, ausente do scrape original) foi
+# MAGIC adicionado só na Bronze, a Silver continuou "cega" pra ele, porque nunca chegou a ler a tabela
+# MAGIC `bronze_bmp` - só voltava direto pros CSVs originais. Corrigido lendo `bronze_bmp` (já teve
+# MAGIC malformação e mixagem de encoding resolvidas, e já inclui 2024) em vez de reprocessar o raw. Daqui pra
+# MAGIC frente, qualquer fonte nova só precisa ser incorporada na Bronze - a Silver herda automaticamente.
 
 # COMMAND ----------
 
-RAW_BMP = "/Volumes/PUC_Sprint_2/anp/raw/bmp"
-PASTA_BMP_CORRIGIDO = "/Volumes/PUC_Sprint_2/anp/raw/bmp_corrigido"
+df_bmp = spark.table("PUC_Sprint_2.anp.bronze_bmp")
 
-# 1a. Identifica quais arquivos do raw têm alta taxa de malformação (coluna "ano" fora do padrão AAAA)
-df_bmp_diagnostico = (spark.read
-    .option("header", True)
-    .csv(f"{RAW_BMP}/*.csv")
-    .withColumn("arquivo_origem", F.col("_metadata.file_path")))
-
-primeira_coluna = df_bmp_diagnostico.columns[0]
-
-resumo_por_arquivo = (df_bmp_diagnostico
-    .withColumn("malformado", ~F.col(primeira_coluna).rlike("^(19|20)[0-9]{2}$"))
-    .groupBy("arquivo_origem")
-    .agg(F.count("*").alias("total"), F.sum(F.col("malformado").cast("int")).alias("malformadas"))
-    .withColumn("pct", F.round(F.col("malformadas") / F.col("total") * 100, 1)))
-
-arquivos_problematicos = [r["arquivo_origem"] for r in resumo_por_arquivo.filter(F.col("pct") > 5).collect()]
-arquivos_ok = [r["arquivo_origem"] for r in resumo_por_arquivo.filter(F.col("pct") <= 5).collect()]
-print(f"{len(arquivos_problematicos)} arquivo(s) problemático(s), {len(arquivos_ok)} arquivo(s) ok")
-
-# COMMAND ----------
-
-# 1b. Corrige os arquivos problemáticos: detecta encoding por arquivo (UTF-8 com BOM ou Latin-1) e
-# desfaz o encapsulamento duplo de aspas, linha a linha. Grava versão corrigida em subpasta separada,
-# sem alterar os arquivos originais do raw.
-os.makedirs(PASTA_BMP_CORRIGIDO, exist_ok=True)
-
-
-def ler_texto_com_encoding_automatico(caminho: str) -> str:
-    with open(caminho, "rb") as f:
-        dados_brutos = f.read()
-    try:
-        return dados_brutos.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return dados_brutos.decode("ISO-8859-1")
-
-
-def corrigir_linha(linha: str) -> str:
-    linha = linha.rstrip("\r\n")
-    if linha.startswith('"') and linha.endswith('"'):
-        linha = linha[1:-1].replace('""', '"')
-    return linha + "\n"
-
-
-for caminho_original in arquivos_problematicos:
-    caminho_local = caminho_original.replace("dbfs:", "")
-    nome_arquivo = os.path.basename(caminho_local)
-    destino = os.path.join(PASTA_BMP_CORRIGIDO, nome_arquivo)
-
-    texto = ler_texto_com_encoding_automatico(caminho_local)
-    with open(destino, "w", encoding="UTF-8") as f_out:
-        for linha in texto.splitlines():
-            f_out.write(corrigir_linha(linha))
-
-print(f"{len(arquivos_problematicos)} arquivo(s) corrigido(s) em {PASTA_BMP_CORRIGIDO}")
-
-# COMMAND ----------
-
-# 1c. Lê os dois conjuntos (arquivos que já liam certo + arquivos corrigidos) e junta em um só DataFrame
-df_bmp_ok = (spark.read
-    .option("header", True)
-    .csv(arquivos_ok))
-
-df_bmp_corrigido = (spark.read
-    .option("header", True)
-    .csv(f"{PASTA_BMP_CORRIGIDO}/*.csv"))
-
-df_bmp = df_bmp_ok.unionByName(df_bmp_corrigido, allowMissingColumns=True)
-
-malformadas_final = df_bmp.filter(~F.col(df_bmp.columns[0]).rlike("^(19|20)[0-9]{2}$")).count()
-print(f"Total após união: {df_bmp.count()} | ainda malformadas: {malformadas_final}")
+# Confere que a Bronze não deixou passar nenhuma linha malformada (coluna "Ano" fora do padrão AAAA)
+malformadas_final = df_bmp.filter(~F.col("Ano").rlike("^(19|20)[0-9]{2}$")).count()
+print(f"Linhas na bronze_bmp: {df_bmp.count()} | malformadas: {malformadas_final}")
 
 # COMMAND ----------
 
