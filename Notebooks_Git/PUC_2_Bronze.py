@@ -1,7 +1,7 @@
 # Databricks notebook source
 # /// script
 # [tool.databricks.environment]
-# environment_version = "5"
+# environment_version = "6"
 # ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Bronze
@@ -21,6 +21,8 @@
 
 import os
 import re
+import unicodedata
+from functools import reduce
 from pyspark.sql import functions as F
 
 CATALOGO = "PUC_Sprint_2"
@@ -58,6 +60,105 @@ def desfazer_encapsulamento_duplo(linha: str) -> str:
     if linha.startswith('"') and linha.endswith('"'):
         linha = linha[1:-1].replace('""', '"')
     return linha + "\n"
+
+
+def detectar_encoding_arquivo(caminho: str) -> str:
+    """Decide o encoding a passar pro spark.read (não reescreve o arquivo, só
+    escolhe a option certa): tenta decodificar o CABEÇALHO (só a 1a linha) como
+    UTF-8 (removendo BOM se houver); se falhar, assume ISO-8859-1. Necessário
+    porque nem todo arquivo do BMP está no mesmo encoding - ex.:
+    producao-mar-2016-2018.csv é Latin-1, mas a maioria é UTF-8.
+
+    Por que só a 1a linha, e não uma amostra maior do arquivo: a primeira versão
+    testava os primeiros 64KB, mas producao-terra-2005-1sem.csv tem cabeçalho em
+    UTF-8 válido e um byte problemático mais adiante no arquivo (fora do
+    cabeçalho) que quebrava a decodificação da amostra inteira - a função
+    concluía (errado) que era Latin-1 e corrompia um cabeçalho que já estava
+    certo (virava mojibake: 'MÃªs/Ano' em vez de 'Mês/Ano'). Testar só a 1a
+    linha resolve porque é só o nome das colunas que essa função decide - o
+    conteúdo do arquivo, linha a linha, o Spark já lê com o encoding escolhido."""
+    caminho_local = caminho.replace("dbfs:", "")
+    with open(caminho_local, "rb") as f:
+        primeira_linha = f.readline()
+    try:
+        primeira_linha.decode("utf-8-sig")
+        return "UTF-8"
+    except UnicodeDecodeError:
+        return "ISO-8859-1"
+
+
+def chave_normalizada(nome: str) -> str:
+    """Normaliza um nome de coluna para comparação: remove colchetes, decompõe
+    acentos via NFKD e descarta os caracteres combinantes (funciona tanto para
+    'ê' como um único code point quanto para 'e' + acento separado - a causa do
+    bug em que "Mês/Ano" digitado à mão não batia com a coluna real), troca
+    superescritos (³, ²) por dígito normal, e baixa a caixa. Usado para renomear
+    BMP por NOME em vez de por POSIÇÃO - ver seção 3 para o porquê disso ser
+    necessário (arquivos da ANP não têm ordem de coluna garantida)."""
+    nome = nome.strip("[] \t")
+    nome = unicodedata.normalize("NFKD", nome)
+    nome = "".join(c for c in nome if not unicodedata.combining(c))
+    nome = nome.replace("³", "3").replace("²", "2")
+    return nome.lower().strip()
+
+
+# Mapa fixo: toda variação conhecida de rótulo de coluna do BMP (com/sem colchete,
+# com/sem acento problemático) -> nome final padronizado. Independente da ordem em
+# que a coluna aparece no arquivo.
+MAPA_COLUNAS_BMP = {
+    "ano": "ano",
+    "mes/ano": "mes_ano",
+    "estado": "estado",
+    "bacia": "bacia",
+    "campo": "campo",
+    "poco": "poco",
+    "ambiente": "ambiente",
+    "instalacao": "instalacao",
+    "producao de oleo (m3)": "producao_oleo_m3",
+    "producao de condensado (m3)": "producao_condensado_m3",
+    "producao de gas associado (mm3)": "producao_gas_associado_mm3",
+    "producao de gas nao associado (mm3)": "producao_gas_nao_associado_mm3",
+    "producao de agua (m3)": "producao_agua_m3",
+    "injecao de gas (mm3)": "injecao_gas_mm3",
+    "injecao de agua para recuperacao secundaria (m3)": "injecao_agua_recuperacao_secundaria_m3",
+    "injecao de agua para descarte (m3)": "injecao_agua_descarte_m3",
+    "injecao de gas carbonico (mm3)": "injecao_gas_carbonico_mm3",
+    "injecao de nitrogenio (mm3)": "injecao_nitrogenio_mm3",
+    "injecao de vapor de agua (t)": "injecao_vapor_agua_t",
+    "injecao de polimeros (m3)": "injecao_polimeros_m3",
+    "injecao de outros fluidos (m3)": "injecao_outros_fluidos_m3",
+}
+
+ORDEM_CANONICA_BMP = list(dict.fromkeys(MAPA_COLUNAS_BMP.values()))
+
+
+def padronizar_colunas_bmp(df, identificador_arquivo=""):
+    """Renomeia as colunas do BMP por NOME (usando MAPA_COLUNAS_BMP), nunca por
+    posição, e devolve sempre na mesma ordem (ORDEM_CANONICA_BMP).
+
+    Por quê: descobrimos que 'producao_por_poco_terra_2025_4_trim.csv' tem a
+    ordem física das colunas diferente do padrão histórico (Estado/Bacia/Campo/
+    Poço/Ambiente/Instalação viram Campo/Bacia/Instalação/Poço/Estado/Ambiente
+    nesse arquivo específico) - Estado e Ambiente coincidem por acaso na posição,
+    mas Campo, Poço e Instalação não. Se esse arquivo fosse lido junto com outros
+    num único spark.read.csv([...]) e só depois renomeado por posição (como era
+    antes), os valores dessas colunas ficariam silenciosamente trocados - sem
+    erro, sem aviso, só dado errado. Renomear por nome, arquivo a arquivo, antes
+    de qualquer união, elimina essa classe inteira de bug."""
+    mapa_renome = {}
+    for coluna_original in df.columns:
+        chave = chave_normalizada(coluna_original)
+        if chave not in MAPA_COLUNAS_BMP:
+            raise ValueError(
+                f"Coluna do BMP não reconhecida em {identificador_arquivo!r}: "
+                f"{coluna_original!r} (chave normalizada: {chave!r}). "
+                f"Adicione essa variação ao MAPA_COLUNAS_BMP antes de prosseguir."
+            )
+        mapa_renome[coluna_original] = MAPA_COLUNAS_BMP[chave]
+
+    for original, novo in mapa_renome.items():
+        df = df.withColumnRenamed(original, novo)
+    return df.select(*ORDEM_CANONICA_BMP)
 
 # COMMAND ----------
 
@@ -110,22 +211,48 @@ df_bar_bronze.printSchema()
 # MAGIC %md
 # MAGIC ## 3. BMP (Boletim Mensal de Produção)
 # MAGIC
-# MAGIC **O que foi encontrado:** nomes de coluna com espaço/parênteses (`Produção de Óleo (m³)`) geravam o
-# MAGIC erro `DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES` - resolvido com `sanitizar_para_delta`, igual às
-# MAGIC outras fontes. Só que, ao investigar por que a contagem de linhas parecia baixa, foi descoberto algo
-# MAGIC mais sério: **~345 mil linhas (7% do total)**, concentradas em 15 arquivos específicos (terra
-# MAGIC trimestral 2018-2021 e mar 2019-2021), vinham malformadas. A causa: cada linha desses arquivos foi
-# MAGIC reencapsulada inteira entre aspas, com toda aspa interna duplicada - um bug de exportação que trata
-# MAGIC uma linha já-CSV como se fosse um único campo de texto a escapar. Além disso, esses 15 arquivos não
-# MAGIC têm um encoding único entre si (alguns Latin-1, alguns UTF-8 com BOM), então a correção detecta o
-# MAGIC encoding arquivo a arquivo antes de desfazer o encapsulamento.
+# MAGIC **Histórico de achados nesta fonte (do mais antigo ao mais recente):**
+# MAGIC 1. Nomes de coluna com espaço/parênteses (`Produção de Óleo (m³)`) geravam
+# MAGIC    `DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES`.
+# MAGIC 2. **~345 mil linhas (7% do total)**, concentradas em 15 arquivos (terra trimestral 2018-2021 e mar
+# MAGIC    2019-2021), vinham malformadas: cada linha estava reencapsulada inteira entre aspas, com toda aspa
+# MAGIC    interna duplicada - bug de exportação que trata uma linha já-CSV como um único campo de texto a
+# MAGIC    escapar. Esses 15 arquivos também não têm encoding único entre si (Latin-1 e UTF-8+BOM misturados).
+# MAGIC 3. O ano de 2024 nunca foi baixado pelo scraper original (nome de arquivo em padrão diferente:
+# MAGIC    `producao_por_poco_2024.csv` + 4 trimestrais `producao-por-poco-terra-trim-*.csv`), e o cabeçalho
+# MAGIC    desses vem com cada nome de coluna literalmente entre colchetes (`[Mês/Ano]`).
+# MAGIC 4. **O mais grave:** o arquivo `producao_por_poco_terra_2025_4_trim.csv` tem a ORDEM FÍSICA das colunas
+# MAGIC    diferente do padrão (`Estado,Bacia,Campo,Poço,Ambiente,Instalação` virou
+# MAGIC    `Campo,Bacia,Instalação,Poço,Estado,Ambiente`). Como o Spark, ao ler vários CSVs de uma vez só
+# MAGIC    (`spark.read.csv([lista])`), não alinha colunas pelo nome do cabeçalho entre arquivos diferentes -
+# MAGIC    só por posição -, esse arquivo vinha silenciosamente embaralhando `Campo`/`Estado`/`Instalação` com
+# MAGIC    os outros arquivos lidos junto. Sem erro, sem aviso, só dado errado (ex.: nome de estado aparecendo
+# MAGIC    na coluna `Ambiente`).
+# MAGIC
+# MAGIC **Correção definitiva (achado 4 exige repensar a estratégia toda):** em vez de ler vários arquivos de
+# MAGIC uma vez e confiar na posição das colunas, agora lemos **cada arquivo individualmente**, renomeamos suas
+# MAGIC colunas **por nome** (função `padronizar_colunas_bmp`, usando o mapa fixo `MAPA_COLUNAS_BMP` definido na
+# MAGIC seção 0) e só então unimos tudo com `unionByName`. Isso elimina de vez essa classe de bug, não só para o
+# MAGIC arquivo de 2025 que já detectamos, mas para qualquer outro arquivo com ordem diferente que ainda não
+# MAGIC tenha sido notado.
 
 # COMMAND ----------
 
 RAW_BMP = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bmp"
+RAW_BMP_2024 = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bmp-2024"
 PASTA_BMP_CORRIGIDO = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bmp_corrigido"
 
-# 3a. Diagnóstico: identifica quais arquivos têm alta taxa de malformação (coluna "ano" fora do padrão AAAA)
+arquivos_2024 = [
+    f"{RAW_BMP_2024}/producao_por_poco_2024.csv",
+    f"{RAW_BMP_2024}/producao-por-poco-terra-trim-1.csv",
+    f"{RAW_BMP_2024}/producao-por-poco-terra-trim-2.csv",
+    f"{RAW_BMP_2024}/producao-por-poco-terra-trim-3.csv",
+    f"{RAW_BMP_2024}/producao_por_poco_terra_trim_4.csv",
+]
+
+# 3a. Diagnóstico: identifica quais arquivos têm alta taxa de malformação (coluna "ano" fora do padrão AAAA).
+# Continua válido mesmo com a ordem de coluna variável, porque "Ano" está sempre na 1a posição em todo
+# arquivo já visto - só a partir da 3a coluna em diante que a ordem pode variar.
 df_bmp_diagnostico = (spark.read
     .option("header", True)
     .csv(f"{RAW_BMP}/*.csv")
@@ -163,64 +290,28 @@ print(f"{len(arquivos_problematicos)} arquivo(s) corrigido(s) em {PASTA_BMP_CORR
 
 # COMMAND ----------
 
-# 3c. Lê os dois conjuntos (arquivos que já liam certo + arquivos corrigidos) e junta em um só DataFrame
-df_bmp_ok = (spark.read
-    .option("header", True)
-    .csv(arquivos_ok))
-
-df_bmp_corrigido = (spark.read
-    .option("header", True)
-    .csv(f"{PASTA_BMP_CORRIGIDO}/*.csv"))
-
-df_bmp = df_bmp_ok.unionByName(df_bmp_corrigido, allowMissingColumns=True)
-
-malformadas_final = df_bmp.filter(~F.col(df_bmp.columns[0]).rlike("^(19|20)[0-9]{2}$")).count()
-print(f"Total após união: {df_bmp.count()} | ainda malformadas: {malformadas_final}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 3d. BMP 2024 - fonte separada, nomenclatura diferente
-# MAGIC
-# MAGIC **O que foi encontrado:** a página de dados abertos não tinha, no scrape original, nenhum arquivo de
-# MAGIC 2024 no padrão `producao-terra-*`/`producao-mar-*`. O ano existe, só que publicado com outro nome de
-# MAGIC arquivo: `producao_por_poco_2024.csv` (ambiente MAR, ano inteiro, 15229 linhas) e 4 arquivos
-# MAGIC trimestrais `producao-por-poco-terra-trim-{1..4}.csv` (ambiente TERRA, um trimestre cada). Validado que
-# MAGIC os 5 juntos cobrem jan-dez/2024 sem sobrepor nenhum mês (cada trimestral tem exatamente 3 meses
-# MAGIC distintos, o anual tem os 12). Além disso, o cabeçalho desses 5 arquivos vem com cada nome de coluna
-# MAGIC literalmente entre colchetes (`[Mês/Ano]`, `[Ano]`, ...) - por isso o `sanitizar_para_delta` acima
-# MAGIC precisou aprender a remover `[` e `]`. Sanitizamos cada fonte (2024 e o restante do BMP) separadamente
-# MAGIC antes de unir, porque só depois da sanitização os nomes ficam iguais o suficiente pra bater
-# MAGIC (`[Mês/Ano]` -> `Mês_Ano` == `Mês/Ano` -> `Mês_Ano`). Esse arquivo também trouxe duas colunas que os
-# MAGIC anos anteriores não tinham (`Ambiente`, `Instalação`) - ficam como novo campo, nulo nas linhas antigas,
-# MAGIC via `allowMissingColumns=True`.
-
-# COMMAND ----------
-
-RAW_BMP_2024 = f"/Volumes/{CATALOGO}/{SCHEMA}/raw/bmp-2024"
-
-arquivos_2024 = [
-    "producao_por_poco_2024.csv",
-    "producao-por-poco-terra-trim-1.csv",
-    "producao-por-poco-terra-trim-2.csv",
-    "producao-por-poco-terra-trim-3.csv",
-    "producao_por_poco_terra_trim_4.csv",
+# 3c. Lê CADA arquivo individualmente (histórico ok + histórico corrigido + os 5 de 2024), detectando o
+# encoding arquivo a arquivo (achado: nem todo BMP é UTF-8, ex. producao-mar-2016-2018.csv é Latin-1) e
+# padronizando colunas por NOME antes de unir - nunca em lote, pra não sofrer o embaralhamento por posição
+# do achado 4. Os arquivos já corrigidos na 3b foram regravados em UTF-8 explicitamente, então a detecção
+# vai confirmar "UTF-8" pra eles sem custo extra - não precisa de tratamento especial aqui.
+caminhos_corrigidos = [
+    f"{PASTA_BMP_CORRIGIDO}/{os.path.basename(c.replace('dbfs:', ''))}"
+    for c in arquivos_problematicos
 ]
+todos_os_caminhos_bmp = list(arquivos_ok) + caminhos_corrigidos + arquivos_2024
 
-df_bmp_2024 = (spark.read
-    .option("header", True)
-    .csv([f"{RAW_BMP_2024}/{nome}" for nome in arquivos_2024]))
+dfs_bmp_padronizados = []
+for caminho in todos_os_caminhos_bmp:
+    encoding = detectar_encoding_arquivo(caminho)
+    df_arquivo = spark.read.option("header", True).option("encoding", encoding).csv(caminho)
+    dfs_bmp_padronizados.append(padronizar_colunas_bmp(df_arquivo, caminho))
 
-# Validação: os 12 meses presentes, sem duplicidade entre os 5 arquivos
-meses_2024 = [r[0] for r in df_bmp_2024.select("[Mês/Ano]").distinct().orderBy("[Mês/Ano]").collect()]
-print(f"BMP 2024: {df_bmp_2024.count()} linhas | {len(meses_2024)} meses distintos: {meses_2024}")
+df_bmp_bronze = reduce(lambda a, b: a.unionByName(b), dfs_bmp_padronizados)
 
-# Sanitiza cada fonte separadamente e só então une - ver explicação acima
-df_bmp_bronze_historico = sanitizar_para_delta(df_bmp)
-df_bmp_bronze_2024 = sanitizar_para_delta(df_bmp_2024)
-
-df_bmp_bronze = df_bmp_bronze_historico.unionByName(df_bmp_bronze_2024, allowMissingColumns=True)
-print(f"BMP total (histórico + 2024): {df_bmp_bronze.count()} linhas")
+malformadas_final = df_bmp_bronze.filter(~F.col("ano").rlike("^(19|20)[0-9]{2}$")).count()
+print(f"BMP total ({len(todos_os_caminhos_bmp)} arquivos lidos): {df_bmp_bronze.count()} linhas | "
+      f"ainda malformadas: {malformadas_final}")
 df_bmp_bronze.printSchema()
 
 # COMMAND ----------

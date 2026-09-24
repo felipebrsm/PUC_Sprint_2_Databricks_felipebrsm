@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Silver
 # MAGIC Consolidação da camada Silver a partir das tabelas Bronze / arquivos raw de BMP, BAR, BDEP e ECO (câmbio + Brent).
@@ -88,34 +92,24 @@ def numero_us_para_double(df, colunas):
 # MAGIC
 # MAGIC **Ajuste de arquitetura:** esta seção lia o `raw/bmp` direto e reimplementava (de novo) a correção de
 # MAGIC encapsulamento duplo/encoding que já tinha sido resolvida na Bronze - duas cópias da mesma lógica.
-# MAGIC Na prática isso mordeu a gente: quando um novo arquivo (BMP 2024, ausente do scrape original) foi
-# MAGIC adicionado só na Bronze, a Silver continuou "cega" pra ele, porque nunca chegou a ler a tabela
-# MAGIC `bronze_bmp` - só voltava direto pros CSVs originais. Corrigido lendo `bronze_bmp` (já teve
-# MAGIC malformação e mixagem de encoding resolvidas, e já inclui 2024) em vez de reprocessar o raw. Daqui pra
-# MAGIC frente, qualquer fonte nova só precisa ser incorporada na Bronze - a Silver herda automaticamente.
+# MAGIC Na prática isso mordeu a gente duas vezes: (1) quando o BMP de 2024 foi incorporado só na Bronze, a
+# MAGIC Silver continuou cega pra ele, e (2) um arquivo de 2025 (`producao_por_poco_terra_2025_4_trim.csv`)
+# MAGIC tinha a ORDEM das colunas diferente do padrão - a Bronze foi reescrita pra renomear por nome (não mais
+# MAGIC por posição, ver `padronizar_colunas_bmp`/`MAPA_COLUNAS_BMP` no notebook Bronze) exatamente por causa
+# MAGIC disso. Corrigido lendo `bronze_bmp` direto em vez de reprocessar o raw - a tabela já sai com nomes de
+# MAGIC coluna padronizados (`ano`, `mes_ano`, `estado`, ...), então nem precisamos mais renomear por posição
+# MAGIC aqui. Daqui pra frente, qualquer fonte nova só precisa ser incorporada na Bronze - a Silver herda
+# MAGIC automaticamente, sem risco de ficar com uma cópia desatualizada da lógica de ingestão.
 
 # COMMAND ----------
 
-df_bmp = spark.table("PUC_Sprint_2.anp.bronze_bmp")
+df_bmp_silver = spark.table("PUC_Sprint_2.anp.bronze_bmp")
 
-# Confere que a Bronze não deixou passar nenhuma linha malformada (coluna "Ano" fora do padrão AAAA)
-malformadas_final = df_bmp.filter(~F.col("Ano").rlike("^(19|20)[0-9]{2}$")).count()
-print(f"Linhas na bronze_bmp: {df_bmp.count()} | malformadas: {malformadas_final}")
+# Confere que a Bronze não deixou passar nenhuma linha malformada (coluna "ano" fora do padrão AAAA)
+malformadas_final = df_bmp_silver.filter(~F.col("ano").rlike("^(19|20)[0-9]{2}$")).count()
+print(f"Linhas na bronze_bmp: {df_bmp_silver.count()} | malformadas: {malformadas_final}")
 
-# COMMAND ----------
-
-# 1d. Padronização final: nomes de coluna, texto (upper/sem acento) e conversão numérica (formato BR)
-nomes_bmp = [
-    "ano", "mes_ano", "estado", "bacia", "campo", "poco", "ambiente", "instalacao",
-    "producao_oleo_m3", "producao_condensado_m3", "producao_gas_associado_mm3",
-    "producao_gas_nao_associado_mm3", "producao_agua_m3", "injecao_gas_mm3",
-    "injecao_agua_recuperacao_secundaria_m3", "injecao_agua_descarte_m3",
-    "injecao_gas_carbonico_mm3", "injecao_nitrogenio_mm3", "injecao_vapor_agua_t",
-    "injecao_polimeros_m3", "injecao_outros_fluidos_m3",
-]
-df_bmp_silver = df_bmp.toDF(*nomes_bmp)
-
-# remove qualquer linha residual malformada (deve ser ~0 depois da correção acima)
+# remove qualquer linha residual malformada (deve ser ~0) e tipa o ano
 df_bmp_silver = df_bmp_silver.filter(F.col("ano").rlike("^(19|20)[0-9]{2}$"))
 df_bmp_silver = df_bmp_silver.withColumn("ano", F.col("ano").try_cast(IntegerType()))
 
