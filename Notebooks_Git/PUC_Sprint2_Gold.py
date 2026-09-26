@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Gold
 # MAGIC Modelo estrela (fact constellation) a partir das tabelas Silver: `dim_campo`, `dim_poco`, `dim_tempo`,
