@@ -1,14 +1,10 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Silver
-# MAGIC Consolidação da camada Silver a partir das tabelas Bronze / arquivos raw de BMP, BAR, BDEP e ECO (câmbio + Brent).
+# MAGIC Consolidação da camada Silver a partir das tabelas Bronze de BMP, BAR, BDEP e ECO (câmbio + Brent).
 # MAGIC
-# MAGIC Este notebook incorpora todas as correções descobertas durante a fase de diagnóstico (mojibake, formato
-# MAGIC numérico BR vs. US, encapsulamento duplo de linhas, encoding misto por arquivo).
+# MAGIC Aqui entram as correções de conteúdo: mojibake, formato numérico (BR vs. US), tipagem e padronização
+# MAGIC de texto.
 
 # COMMAND ----------
 
@@ -30,7 +26,7 @@ def remover_acentos(texto: str) -> str:
 
 
 def limpar_nome_generico(nome: str) -> str:
-    """Nome de coluna sem acento, minúsculo, sem espaço/parêntese/barra."""
+    """Deixa o nome de coluna sem acento, minúsculo e sem espaço/parêntese/barra."""
     nome = remover_acentos(nome.strip().lower())
     nome = re.sub(r"\(.*?\)", "", nome)
     nome = re.sub(r"[ ,;{}()\n\t=/-]+", "_", nome)
@@ -46,15 +42,12 @@ def padronizar_texto(df, colunas=None):
 
 
 def corrigir_mojibake_colunas(df, colunas):
-    """Corrige mojibake testando o RESULTADO da correção, não o padrão da entrada.
-    Um 'Ã' seguido de letra pode ser mojibake real (ex.: 'PetrÃ³leo') ou uma letra
-    portuguesa legítima (ex.: 'GaviÃO', 'SÃO') - não dá para diferenciar só olhando
-    a entrada, como a primeira versão desta função tentava fazer (o que corrompeu
-    'GAVIÃO' -> 'GAVI�O' e similares). A diferença aparece no resultado: se o
-    texto já estava certo, reconvertê-lo gera um caractere de erro '�' (a
-    sequência de bytes não forma UTF-8 válido); se era mojibake de verdade, o
-    resultado sai limpo. Por isso só aplicamos a correção quando o resultado
-    não contém '�'."""
+    """Corrige mojibake testando o RESULTADO da correção, não a entrada. Um 'Ã'
+    seguido de letra pode ser mojibake real ('PetrÃ³leo') ou uma letra portuguesa
+    legítima ('GaviÃO'), e olhar só a entrada não diferencia os dois casos - foi
+    o que uma versão anterior fazia, e corrompia palavras corretas. Por isso só
+    aplicamos a correção quando reconverter o texto NÃO gera um caractere de
+    erro '�'."""
     for c in colunas:
         candidato = F.decode(F.encode(F.col(c), "ISO-8859-1"), "UTF-8")
         usar_candidato = F.col(c).rlike("[ÃÂ]") & ~candidato.contains("\uFFFD")
@@ -63,8 +56,8 @@ def corrigir_mojibake_colunas(df, colunas):
 
 
 def numero_br_para_double(df, colunas):
-    """Formato brasileiro: ponto = milhar, vírgula = decimal. Usado no BMP.
-    Remove também aspas soltas/quebras de linha residuais (artefato de exportação)."""
+    """Converte número em formato brasileiro (ponto = milhar, vírgula = decimal),
+    usado no BMP. Remove também aspas soltas e quebras de linha residuais."""
     for c in colunas:
         valor = F.col(c).cast("string")
         valor = F.regexp_replace(valor, r'["\n\r]', "")

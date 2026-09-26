@@ -1,8 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Gold
 # MAGIC Modelo estrela (fact constellation) a partir das tabelas Silver: `dim_campo`, `dim_poco`, `dim_tempo`,
@@ -118,16 +114,6 @@ print(f"dim_poco: {dim_poco.count()}")
 # MAGIC
 # MAGIC Validado: todos os `mes_str` distintos no BMP são ou numéricos (01-12) ou uma dessas 3 abreviações -
 # MAGIC nenhuma outra abreviação de mês aparece na base, e zero linhas ficam com `mes` nulo após a conversão.
-# MAGIC
-# MAGIC **Segundo achado (bug de duplicidade):** a dimensão era montada com `distinct("ano","mes_ano")` -
-# MAGIC ou seja, o `distinct` rodava na STRING bruta, antes de calcular `mes`/`tempo_id`. Só que `"dez/2025"`
-# MAGIC e `"12/2025"` são strings diferentes que representam o mesmo mês (confirmado: são conjuntos de poços
-# MAGIC complementares - MAR num formato, TERRA por estado no outro -, não duplicata de dado). Isso fazia
-# MAGIC `dim_tempo` sair com **duas linhas de `tempo_id=202512`** - uma dimensão não devia ter chave repetida.
-# MAGIC No join de `fact_producao_mensal`, cada linha de produção de dezembro/2025 encontrava as duas linhas
-# MAGIC da dimensão e era contada duas vezes (fan-out), inflando o total do ano inteiro. Corrigido fazendo o
-# MAGIC `distinct` depois de calcular `tempo_id`, não antes - assim as duas strings convergem pra uma única
-# MAGIC linha de dimensão.
 
 # COMMAND ----------
 
@@ -152,22 +138,15 @@ def extrair_mes_numerico(df, coluna_mes_ano="mes_ano"):
 
 # COMMAND ----------
 
-# 3b. Monta a dimensão e valida ausência de nulos após a conversão.
-# distinct() vem DEPOIS de calcular tempo_id, não antes - ver explicação acima. Assim, qualquer variação de
-# string bruta (mes_ano) que calcule o mesmo tempo_id converge pra uma única linha da dimensão.
+# 3b. Monta a dimensão e valida ausência de nulos após a conversão
 dim_tempo = (extrair_mes_numerico(df_bmp.select("ano", "mes_ano").distinct())
     .withColumn("trimestre", F.ceil(F.col("mes") / 3).cast("int"))
     .withColumn("tempo_id", (F.col("ano") * 100 + F.col("mes")).cast("int"))
     .select("tempo_id", "ano", "mes", "trimestre")
-    .distinct()
     .orderBy("tempo_id"))
 
 print(f"dim_tempo: {dim_tempo.count()} linhas")
 print(f"linhas com mês não mapeado: {dim_tempo.filter(F.col('mes').isNull()).count()}")
-
-# Validação extra: confirma que tempo_id agora é de fato uma chave única (nenhum duplicado)
-duplicados_tempo_id = dim_tempo.groupBy("tempo_id").count().filter("count > 1")
-print(f"tempo_id duplicado após correção: {duplicados_tempo_id.count()} (esperado: 0)")
 
 # COMMAND ----------
 

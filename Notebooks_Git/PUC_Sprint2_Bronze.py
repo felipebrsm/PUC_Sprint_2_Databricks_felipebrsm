@@ -1,17 +1,12 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # MAGIC %md
 # MAGIC # PUC_Sprint2_Bronze
 # MAGIC Ingestão das 4 fontes (BDEP, BAR, BMP, ECO) do volume `raw` para tabelas Delta Bronze.
 # MAGIC
-# MAGIC Papel da Bronze: trazer o dado para dentro do Unity Catalog preservando-o o mais próximo possível do
-# MAGIC original - a única transformação aceita aqui é o mínimo necessário para o Delta aceitar a tabela
-# MAGIC (nome de coluna sem caractere proibido) e, no caso do BMP, corrigir uma falha de parsing que impedia
-# MAGIC a leitura correta de ~7% das linhas. Acento, caixa alta/baixa, tipo numérico e limpeza "bonita" ficam
-# MAGIC para a Silver.
+# MAGIC Aqui o dado entra no Unity Catalog o mais próximo possível do original. Só ajustamos o mínimo pro
+# MAGIC Delta aceitar a tabela (nomes de coluna sem caractere proibido) e, no BMP, corrigimos um problema de
+# MAGIC parsing que estava derrubando ~7% das linhas. Acento, caixa alta/baixa, tipo numérico e limpeza
+# MAGIC "bonita" ficam pra Silver.
 
 # COMMAND ----------
 
@@ -30,14 +25,12 @@ SCHEMA = "anp"
 
 
 def sanitizar_para_delta(df):
-    """O mínimo necessário para o Delta aceitar a tabela: troca só os caracteres
-    proibidos (espaço, vírgula, ponto-e-vírgula, chaves, parênteses, colchetes, tab,
-    quebra de linha, igual) por '_'. Mantém acento, maiúscula, tudo o resto como veio
-    do arquivo original - deixar "bonito" é trabalho da Silver, não da Bronze.
-    Colchetes '[]' foram adicionados depois de descobrir que o arquivo de BMP de 2024
-    (producao_por_poco_2024.csv e os 4 trimestrais de terra) vem com o nome de cada
-    coluna literalmente entre colchetes, ex.: '[Mês/Ano]' - não é um jeito de exibição,
-    é a string real da coluna, então sem esse ajuste ela sobrevivia à sanitização."""
+    """Troca só os caracteres que o Delta proíbe em nome de coluna (espaço, vírgula,
+    ponto-e-vírgula, chaves, parênteses, colchetes, tab, quebra de linha, igual) por
+    '_'. Mantém acento e maiúscula como veio do arquivo - deixar "bonito" é trabalho
+    da Silver. Os colchetes entraram na lista depois que os arquivos de BMP de 2024
+    apareceram com o nome de cada coluna literalmente entre colchetes (ex.:
+    '[Mês/Ano]'), e não como um efeito visual do Databricks."""
     novos_nomes = [re.sub(r"[ ,;{}()\[\]\n\t=/]+", "_", c).strip("_") for c in df.columns]
     return df.toDF(*novos_nomes)
 
@@ -53,9 +46,9 @@ def ler_texto_com_encoding_automatico(caminho: str) -> str:
 
 
 def desfazer_encapsulamento_duplo(linha: str) -> str:
-    """Desfaz o bug de exportação em que uma linha de CSV já válida foi
-    reencapsulada inteira entre aspas, com toda aspa interna duplicada
-    (ex.: '"122,119"' virou '""122,119""'). Ver seção 3 para o contexto completo."""
+    """Desfaz um bug de exportação: uma linha de CSV já válida foi reencapsulada
+    inteira entre aspas, com toda aspa interna duplicada (ex.: '"122,119"' virou
+    '""122,119""'). Detalhes na seção 3."""
     linha = linha.rstrip("\r\n")
     if linha.startswith('"') and linha.endswith('"'):
         linha = linha[1:-1].replace('""', '"')
@@ -63,20 +56,17 @@ def desfazer_encapsulamento_duplo(linha: str) -> str:
 
 
 def detectar_encoding_arquivo(caminho: str) -> str:
-    """Decide o encoding a passar pro spark.read (não reescreve o arquivo, só
-    escolhe a option certa): tenta decodificar o CABEÇALHO (só a 1a linha) como
-    UTF-8 (removendo BOM se houver); se falhar, assume ISO-8859-1. Necessário
-    porque nem todo arquivo do BMP está no mesmo encoding - ex.:
-    producao-mar-2016-2018.csv é Latin-1, mas a maioria é UTF-8.
+    """Escolhe o encoding a passar pro spark.read, testando só a 1ª linha
+    (cabeçalho) como UTF-8; se falhar, assume ISO-8859-1. Precisa ser por arquivo
+    porque nem todo BMP está no mesmo encoding (ex.: producao-mar-2016-2018.csv
+    é Latin-1, a maioria é UTF-8).
 
-    Por que só a 1a linha, e não uma amostra maior do arquivo: a primeira versão
-    testava os primeiros 64KB, mas producao-terra-2005-1sem.csv tem cabeçalho em
-    UTF-8 válido e um byte problemático mais adiante no arquivo (fora do
-    cabeçalho) que quebrava a decodificação da amostra inteira - a função
-    concluía (errado) que era Latin-1 e corrompia um cabeçalho que já estava
-    certo (virava mojibake: 'MÃªs/Ano' em vez de 'Mês/Ano'). Testar só a 1a
-    linha resolve porque é só o nome das colunas que essa função decide - o
-    conteúdo do arquivo, linha a linha, o Spark já lê com o encoding escolhido."""
+    Testamos só a 1ª linha, não uma amostra maior, porque uma versão anterior
+    testava os primeiros 64KB e se enganava com producao-terra-2005-1sem.csv:
+    o cabeçalho é UTF-8 válido, mas um byte problemático mais adiante no arquivo
+    quebrava a amostra inteira, levando a função a concluir (errado) Latin-1 e
+    corromper um cabeçalho que já estava certo. Como essa função só decide o
+    nome das colunas, basta olhar a linha do cabeçalho."""
     caminho_local = caminho.replace("dbfs:", "")
     with open(caminho_local, "rb") as f:
         primeira_linha = f.readline()
@@ -88,13 +78,10 @@ def detectar_encoding_arquivo(caminho: str) -> str:
 
 
 def chave_normalizada(nome: str) -> str:
-    """Normaliza um nome de coluna para comparação: remove colchetes, decompõe
-    acentos via NFKD e descarta os caracteres combinantes (funciona tanto para
-    'ê' como um único code point quanto para 'e' + acento separado - a causa do
-    bug em que "Mês/Ano" digitado à mão não batia com a coluna real), troca
-    superescritos (³, ²) por dígito normal, e baixa a caixa. Usado para renomear
-    BMP por NOME em vez de por POSIÇÃO - ver seção 3 para o porquê disso ser
-    necessário (arquivos da ANP não têm ordem de coluna garantida)."""
+    """Normaliza um nome de coluna para comparação: remove colchetes, tira os
+    acentos (via NFKD, funciona independente de como o acento foi codificado),
+    troca ³/² por dígito normal e baixa a caixa. É a base pra renomear as colunas
+    do BMP por nome em vez de por posição (seção 3 explica o porquê)."""
     nome = nome.strip("[] \t")
     nome = unicodedata.normalize("NFKD", nome)
     nome = "".join(c for c in nome if not unicodedata.combining(c))
@@ -102,9 +89,8 @@ def chave_normalizada(nome: str) -> str:
     return nome.lower().strip()
 
 
-# Mapa fixo: toda variação conhecida de rótulo de coluna do BMP (com/sem colchete,
-# com/sem acento problemático) -> nome final padronizado. Independente da ordem em
-# que a coluna aparece no arquivo.
+# Mapa fixo com toda variação conhecida de nome de coluna do BMP -> nome padronizado,
+# independente da ordem em que a coluna aparece no arquivo.
 MAPA_COLUNAS_BMP = {
     "ano": "ano",
     "mes/ano": "mes_ano",
@@ -133,18 +119,14 @@ ORDEM_CANONICA_BMP = list(dict.fromkeys(MAPA_COLUNAS_BMP.values()))
 
 
 def padronizar_colunas_bmp(df, identificador_arquivo=""):
-    """Renomeia as colunas do BMP por NOME (usando MAPA_COLUNAS_BMP), nunca por
-    posição, e devolve sempre na mesma ordem (ORDEM_CANONICA_BMP).
+    """Renomeia as colunas do BMP por nome (usando MAPA_COLUNAS_BMP), nunca por
+    posição, sempre devolvendo na mesma ordem (ORDEM_CANONICA_BMP).
 
-    Por quê: descobrimos que 'producao_por_poco_terra_2025_4_trim.csv' tem a
-    ordem física das colunas diferente do padrão histórico (Estado/Bacia/Campo/
-    Poço/Ambiente/Instalação viram Campo/Bacia/Instalação/Poço/Estado/Ambiente
-    nesse arquivo específico) - Estado e Ambiente coincidem por acaso na posição,
-    mas Campo, Poço e Instalação não. Se esse arquivo fosse lido junto com outros
-    num único spark.read.csv([...]) e só depois renomeado por posição (como era
-    antes), os valores dessas colunas ficariam silenciosamente trocados - sem
-    erro, sem aviso, só dado errado. Renomear por nome, arquivo a arquivo, antes
-    de qualquer união, elimina essa classe inteira de bug."""
+    Isso existe porque um dos arquivos de 2025 tem a ordem física das colunas
+    diferente do padrão histórico (Campo e Poço trocados de lugar, por exemplo).
+    Se os arquivos fossem lidos juntos e renomeados por posição, como era antes,
+    esses valores ficariam silenciosamente trocados - sem erro, só dado errado.
+    Renomear por nome, arquivo a arquivo, elimina esse risco de vez."""
     mapa_renome = {}
     for coluna_original in df.columns:
         chave = chave_normalizada(coluna_original)
@@ -165,9 +147,9 @@ def padronizar_colunas_bmp(df, identificador_arquivo=""):
 # MAGIC %md
 # MAGIC ## 1. BDEP (Poços Perfurados Públicos)
 # MAGIC
-# MAGIC **O que foi encontrado:** a primeira leitura (com `sep=","` padrão) concatenou todas as colunas em
-# MAGIC uma só - o arquivo usa `;` como separador, não vírgula. Depois de corrigir o separador, os valores de
-# MAGIC texto vieram com acentuação corrompida (`Ã‡`, `Ã©`) - sinal de arquivo em `ISO-8859-1` lido como UTF-8.
+# MAGIC A leitura com `sep=","` padrão concatenou todas as colunas numa só - o arquivo usa `;`. Depois de
+# MAGIC corrigir o separador, o texto veio com acentuação corrompida (`Ã‡`, `Ã©`), sinal de arquivo em
+# MAGIC `ISO-8859-1` lido como UTF-8. Ajustamos os dois pontos direto na leitura.
 
 # COMMAND ----------
 
@@ -187,11 +169,10 @@ df_bdep_bronze.printSchema()
 # MAGIC %md
 # MAGIC ## 2. BAR (Boletim Anual de Recursos e Reservas)
 # MAGIC
-# MAGIC **O que foi encontrado:** ao reaproveitar por engano as options do BDEP (`sep=";"`,
-# MAGIC `encoding="ISO-8859-1"`) o arquivo do BAR virou uma bagunça - ele é, na verdade, separado por vírgula
-# MAGIC e já está em UTF-8 (foi exportado localmente via pandas a partir do xlsx original). Corrigido, os nomes
-# MAGIC de coluna originais (`VOIP (bbl)`, `Campo/Área de desenvolvimento`, etc.) ainda têm caracteres que o
-# MAGIC Delta rejeita - por isso passam pelo mesmo `sanitizar_para_delta` do BDEP.
+# MAGIC Reaproveitamos por engano as options do BDEP (`;`/ISO-8859-1) e o arquivo virou bagunça. O BAR é, na
+# MAGIC verdade, separado por vírgula e já em UTF-8 (exportado localmente via pandas a partir do xlsx
+# MAGIC original). Corrigido isso, os nomes de coluna (`VOIP (bbl)`, `Campo/Área de desenvolvimento`, etc.)
+# MAGIC ainda têm caracteres que o Delta rejeita, então passam pelo mesmo `sanitizar_para_delta` do BDEP.
 
 # COMMAND ----------
 
@@ -211,30 +192,20 @@ df_bar_bronze.printSchema()
 # MAGIC %md
 # MAGIC ## 3. BMP (Boletim Mensal de Produção)
 # MAGIC
-# MAGIC **Histórico de achados nesta fonte (do mais antigo ao mais recente):**
-# MAGIC 1. Nomes de coluna com espaço/parênteses (`Produção de Óleo (m³)`) geravam
-# MAGIC    `DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES`.
-# MAGIC 2. **~345 mil linhas (7% do total)**, concentradas em 15 arquivos (terra trimestral 2018-2021 e mar
-# MAGIC    2019-2021), vinham malformadas: cada linha estava reencapsulada inteira entre aspas, com toda aspa
-# MAGIC    interna duplicada - bug de exportação que trata uma linha já-CSV como um único campo de texto a
-# MAGIC    escapar. Esses 15 arquivos também não têm encoding único entre si (Latin-1 e UTF-8+BOM misturados).
-# MAGIC 3. O ano de 2024 nunca foi baixado pelo scraper original (nome de arquivo em padrão diferente:
-# MAGIC    `producao_por_poco_2024.csv` + 4 trimestrais `producao-por-poco-terra-trim-*.csv`), e o cabeçalho
-# MAGIC    desses vem com cada nome de coluna literalmente entre colchetes (`[Mês/Ano]`).
-# MAGIC 4. **O mais grave:** o arquivo `producao_por_poco_terra_2025_4_trim.csv` tem a ORDEM FÍSICA das colunas
-# MAGIC    diferente do padrão (`Estado,Bacia,Campo,Poço,Ambiente,Instalação` virou
-# MAGIC    `Campo,Bacia,Instalação,Poço,Estado,Ambiente`). Como o Spark, ao ler vários CSVs de uma vez só
-# MAGIC    (`spark.read.csv([lista])`), não alinha colunas pelo nome do cabeçalho entre arquivos diferentes -
-# MAGIC    só por posição -, esse arquivo vinha silenciosamente embaralhando `Campo`/`Estado`/`Instalação` com
-# MAGIC    os outros arquivos lidos junto. Sem erro, sem aviso, só dado errado (ex.: nome de estado aparecendo
-# MAGIC    na coluna `Ambiente`).
+# MAGIC Essa foi a fonte com mais problemas, encontrados em ordem: nomes de coluna com espaço/parênteses
+# MAGIC quebravam a gravação em Delta; cerca de 345 mil linhas (7% do total, em 15 arquivos) vinham malformadas
+# MAGIC porque a linha inteira tinha sido reencapsulada entre aspas por um bug de exportação; o ano de 2024
+# MAGIC nunca foi baixado pelo scraper original, porque o nome dos arquivos seguia um padrão diferente; e o
+# MAGIC mais sério, um arquivo de 2025 veio com a ORDEM das colunas trocada (Campo e Poço, por exemplo,
+# MAGIC invertidos de posição). Como o Spark lê vários CSVs de uma vez alinhando por posição e não por nome do
+# MAGIC cabeçalho, esse arquivo embaralhava valores silenciosamente ao ser lido junto com os outros - sem erro,
+# MAGIC só dado errado.
 # MAGIC
-# MAGIC **Correção definitiva (achado 4 exige repensar a estratégia toda):** em vez de ler vários arquivos de
-# MAGIC uma vez e confiar na posição das colunas, agora lemos **cada arquivo individualmente**, renomeamos suas
-# MAGIC colunas **por nome** (função `padronizar_colunas_bmp`, usando o mapa fixo `MAPA_COLUNAS_BMP` definido na
-# MAGIC seção 0) e só então unimos tudo com `unionByName`. Isso elimina de vez essa classe de bug, não só para o
-# MAGIC arquivo de 2025 que já detectamos, mas para qualquer outro arquivo com ordem diferente que ainda não
-# MAGIC tenha sido notado.
+# MAGIC A correção definitiva foi mudar a estratégia: em vez de ler vários arquivos de uma vez confiando na
+# MAGIC posição, agora lemos cada arquivo individualmente, renomeamos as colunas por nome
+# MAGIC (`padronizar_colunas_bmp`, com o mapa `MAPA_COLUNAS_BMP` da seção 0) e só então unimos tudo com
+# MAGIC `unionByName`. Isso resolve não só o arquivo de 2025 já identificado, mas qualquer outro com ordem
+# MAGIC diferente que ainda não tenha aparecido.
 
 # COMMAND ----------
 
@@ -319,10 +290,8 @@ df_bmp_bronze.printSchema()
 # MAGIC %md
 # MAGIC ## 4. ECO (Câmbio + Brent)
 # MAGIC
-# MAGIC **O que foi encontrado:** as duas fontes vêm de API (BCB e EIA), baixadas localmente e já em UTF-8
-# MAGIC padrão, sem os problemas de encoding/separador da ANP - só passam pelo `sanitizar_para_delta` por
-# MAGIC consistência com as demais tabelas (nenhum dos nomes de coluna dessas fontes tem caractere proibido,
-# MAGIC mas mantemos o passo para garantir robustez caso a API mude o formato no futuro).
+# MAGIC Essas duas fontes vêm de API (BCB e EIA), já em UTF-8 padrão, sem os problemas de encoding/separador
+# MAGIC da ANP. Passam pelo `sanitizar_para_delta` só por consistência com as demais tabelas.
 
 # COMMAND ----------
 
@@ -346,10 +315,9 @@ df_brent_bronze.printSchema()
 
 # MAGIC %md ## 5. Gravação das tabelas Bronze
 # MAGIC
-# MAGIC Usamos `DROP TABLE` antes de recriar, em vez de confiar só em `overwrite`/`overwriteSchema` -
-# MAGIC durante o desenvolvimento iterativo deste pipeline, uma tabela chegou a reter metadado de schema
-# MAGIC de versões anteriores (nomes de coluna antigos), causando `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` mesmo
-# MAGIC com o DataFrame novo correto. Apagar e recriar elimina esse tipo de inconsistência.
+# MAGIC Foi usada `DROP TABLE` antes de recriar, em vez de confiar só em overwrite: durante o desenvolvimento,
+# MAGIC uma tabela chegou a reter metadado de schema de uma versão anterior e dava erro de coluna não
+# MAGIC encontrada mesmo com o DataFrame novo correto. Apagar e recriar evita esse tipo de inconsistência.
 
 # COMMAND ----------
 
