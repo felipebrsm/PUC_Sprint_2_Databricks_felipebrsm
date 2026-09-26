@@ -1,5 +1,8 @@
 # MVP - Análise de Produção de Petróleo e Gás (ANP)
 
+Autor: Felipe Barreto Ribeiro Santos Macedo 
+Matrícula: 4052026000629
+
 Projeto de conclusão da disciplina de Engenharia de Dados (PUC - Pós-Graduação em Ciência de Dados), construído em Databricks com arquitetura medallion (Bronze / Silver / Gold) sobre dados públicos da ANP.
 
 ## Objetivo
